@@ -13,7 +13,9 @@ Coolify-deployable Speech-to-Text worker: downloads YouTube audio with **yt-dlp*
 
 **Success**: `{ "transcript": "...", "videoId": "...", "source": "whisper" }`
 
-**Errors**: `{ "error": "message" }` with 4xx/5xx (401 auth, 400 bad input / too long, 429 busy, 504 timeout).
+**Errors**: `{ "error": "message", "code"?: "…" }` with 4xx/5xx (401 auth, 400 bad input / too long, 429 busy, 503 YouTube bot check, 504 timeout).
+
+When YouTube returns “Sign in to confirm you’re not a bot”, the worker responds **503** with `"code": "YOUTUBE_BOT_CHECK"` and asks you to supply cookies (see env below).
 
 ## Environment
 
@@ -24,6 +26,8 @@ Coolify-deployable Speech-to-Text worker: downloads YouTube audio with **yt-dlp*
 | `DOWNLOAD_TIMEOUT` | no | `120` | seconds |
 | `TRANSCRIBE_TIMEOUT` | no | `600` | seconds |
 | `METADATA_TIMEOUT` | no | `30` | seconds |
+| `YTDLP_COOKIES_FILE` | no | `/data/youtube.cookies.txt` if that file exists | Path to Netscape `cookies.txt` for yt-dlp (mount a volume in Coolify) |
+| `YTDLP_COOKIES` | no | — | Alternate: paste full Netscape `cookies.txt` contents; worker writes a temp file. Prefer `YTDLP_COOKIES_FILE` + volume when possible. **Never commit real cookies to git.** |
 
 ## RAM note
 
@@ -68,3 +72,12 @@ docker run --rm -p 8000:8000 \
 ```
 
 **Coolify**: point the service at this folder (Dockerfile), map port **8000**, set `STT_WORKER_SECRET` (and optionally `WHISPER_MODEL`) in the service env. Do not bake secrets into the image.
+
+### YouTube bot check / cookies (Coolify)
+
+YouTube often blocks datacenter IPs with “Sign in to confirm you’re not a bot”. Fix by giving yt-dlp browser cookies from a logged-in YouTube session (export Netscape `cookies.txt` via a browser extension):
+
+1. **Preferred**: mount a volume at `/data` and place `youtube.cookies.txt` there. The worker auto-uses `/data/youtube.cookies.txt` when present, or set `YTDLP_COOKIES_FILE` to another path.
+2. **Alt**: set Coolify env `YTDLP_COOKIES` to the full Netscape file contents (large; works without a volume).
+
+Do **not** commit cookie files or paste real cookies into git / Dockerfiles. Rotate cookies if they leak. Redeploy after changing env/volumes.

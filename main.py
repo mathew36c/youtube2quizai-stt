@@ -30,6 +30,7 @@ MAX_DURATION_SECONDS = 20 * 60  # 20 minutes
 DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "120"))
 TRANSCRIBE_TIMEOUT = int(os.environ.get("TRANSCRIBE_TIMEOUT", "600"))
 METADATA_TIMEOUT = int(os.environ.get("METADATA_TIMEOUT", "30"))
+DEFAULT_COOKIES_PATH = "/data/youtube.cookies.txt"
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -40,6 +41,7 @@ VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _job_lock = asyncio.Lock()
 _whisper_model = None
 _model_lock = asyncio.Lock()
+_COOKIE_TMP: Optional[str] = None
 
 
 def _require_secret() -> None:
@@ -118,6 +120,7 @@ class TranscribeResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: str
+    code: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +158,91 @@ def _youtube_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def _is_bot_check_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "sign in to confirm" in msg
+        or "not a bot" in msg
+        or ("confirm you" in msg and "bot" in msg)
+    )
+
+
+def _resolve_cookiefile() -> Optional[str]:
+    """Return a Netscape cookies.txt path for yt-dlp, or None.
+
+    - YTDLP_COOKIES_FILE: path to cookies file
+    - else default /data/youtube.cookies.txt if present
+    - else YTDLP_COOKIES: Netscape cookies.txt contents → temp file
+    Never log cookie contents.
+    """
+    global _COOKIE_TMP
+
+    explicit = (os.environ.get("YTDLP_COOKIES_FILE") or "").strip()
+    if explicit:
+        if os.path.isfile(explicit) and os.path.getsize(explicit) > 0:
+            return explicit
+        logger.warning("YTDLP_COOKIES_FILE set but file missing/empty: %s", explicit)
+
+    if os.path.isfile(DEFAULT_COOKIES_PATH) and os.path.getsize(DEFAULT_COOKIES_PATH) > 0:
+        return DEFAULT_COOKIES_PATH
+
+    raw = os.environ.get("YTDLP_COOKIES")
+    if raw and raw.strip():
+        # If someone mistakenly put a path in YTDLP_COOKIES, treat as file path
+        candidate = raw.strip()
+        if (
+            "\n" not in candidate
+            and len(candidate) < 512
+            and os.path.isfile(candidate)
+            and os.path.getsize(candidate) > 0
+        ):
+            return candidate
+
+        if _COOKIE_TMP and os.path.isfile(_COOKIE_TMP):
+            return _COOKIE_TMP
+        fd, path = tempfile.mkstemp(prefix="ytdlp_cookies_", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(raw)
+                if not raw.endswith("\n"):
+                    f.write("\n")
+            os.chmod(path, 0o600)
+            _COOKIE_TMP = path
+            logger.info("Wrote yt-dlp cookies from YTDLP_COOKIES env to temp file")
+            return path
+        except Exception:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+
+    return None
+
+
+def _ytdlp_cookie_opts() -> dict:
+    cookiefile = _resolve_cookiefile()
+    if cookiefile:
+        logger.info("yt-dlp using cookiefile=%s", cookiefile)
+        return {"cookiefile": cookiefile}
+    return {}
+
+
+def _bot_check_http_exception() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": (
+                "YouTube bot check blocked audio download. "
+                "Provide yt-dlp cookies via Coolify env YTDLP_COOKIES_FILE "
+                "(path to Netscape cookies.txt, default /data/youtube.cookies.txt) "
+                "or YTDLP_COOKIES (Netscape cookies.txt contents)."
+            ),
+            "code": "YOUTUBE_BOT_CHECK",
+        },
+    )
+
+
 def _check_auth(authorization: Optional[str]) -> None:
     if not authorization:
         raise HTTPException(
@@ -176,6 +264,7 @@ def _fetch_duration(url: str) -> Optional[float]:
         "no_warnings": True,
         "skip_download": True,
         "socket_timeout": METADATA_TIMEOUT,
+        **_ytdlp_cookie_opts(),
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -203,6 +292,7 @@ def _download_audio(url: str, out_dir: str) -> str:
                 "preferredquality": "128",
             }
         ],
+        **_ytdlp_cookie_opts(),
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -238,7 +328,11 @@ def _transcribe_file(audio_path: str) -> str:
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "cookiesConfigured": bool(_resolve_cookiefile()),
+        "model": WHISPER_MODEL,
+    }
 
 
 @app.exception_handler(HTTPException)
@@ -279,6 +373,7 @@ async def unhandled_exception_handler(_request: Request, exc: Exception):
         401: {"model": ErrorResponse},
         429: {"model": ErrorResponse},
         500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
         504: {"model": ErrorResponse},
     },
 )
@@ -323,6 +418,8 @@ async def transcribe(
             raise
         except Exception as e:
             logger.warning("Metadata fetch failed for %s: %s", video_id, e)
+            if _is_bot_check_error(e):
+                raise _bot_check_http_exception() from e
             raise HTTPException(
                 status_code=400,
                 detail={"error": f"Could not fetch video metadata: {e}"},
@@ -362,6 +459,8 @@ async def transcribe(
             raise
         except Exception as e:
             logger.warning("Download failed for %s: %s", video_id, e)
+            if _is_bot_check_error(e):
+                raise _bot_check_http_exception() from e
             raise HTTPException(
                 status_code=400,
                 detail={"error": f"Audio download failed: {e}"},
