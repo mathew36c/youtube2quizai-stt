@@ -220,6 +220,21 @@ def _resolve_cookiefile() -> Optional[str]:
     return None
 
 
+def _ytdlp_extractor_args() -> dict:
+    """Prefer android (and similar) clients so downloads often work without cookies.
+
+    Proven on residential/DHCP networks: player_client=android avoids web bot-check.
+    Cookies remain an optional fallback when present (see _ytdlp_cookie_opts).
+    """
+    return {
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "android_vr", "ios", "tv", "web"],
+            }
+        }
+    }
+
+
 def _ytdlp_cookie_opts() -> dict:
     cookiefile = _resolve_cookiefile()
     if cookiefile:
@@ -233,10 +248,11 @@ def _bot_check_http_exception() -> HTTPException:
         status_code=503,
         detail={
             "error": (
-                "YouTube bot check blocked audio download. "
-                "Provide yt-dlp cookies via Coolify env YTDLP_COOKIES_FILE "
-                "(path to Netscape cookies.txt, default /data/youtube.cookies.txt) "
-                "or YTDLP_COOKIES (Netscape cookies.txt contents)."
+                "YouTube bot check blocked audio download even with android "
+                "player client. Optional fallback: provide yt-dlp cookies via "
+                "Coolify env YTDLP_COOKIES_FILE (path to Netscape cookies.txt, "
+                "default /data/youtube.cookies.txt) or YTDLP_COOKIES (contents). "
+                "Or try a PO Token provider / residential proxy (see README)."
             ),
             "code": "YOUTUBE_BOT_CHECK",
         },
@@ -264,6 +280,7 @@ def _fetch_duration(url: str) -> Optional[float]:
         "no_warnings": True,
         "skip_download": True,
         "socket_timeout": METADATA_TIMEOUT,
+        **_ytdlp_extractor_args(),
         **_ytdlp_cookie_opts(),
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -292,6 +309,7 @@ def _download_audio(url: str, out_dir: str) -> str:
                 "preferredquality": "128",
             }
         ],
+        **_ytdlp_extractor_args(),
         **_ytdlp_cookie_opts(),
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
