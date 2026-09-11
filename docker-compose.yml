@@ -1,0 +1,37 @@
+# Coolify: deploy this repo as a Docker Compose application so STT and
+# bgutil-pot share one network. Hostname `bgutil-pot` must resolve from `stt`
+# (fixes Contabo: Could not resolve host: bgutil-pot).
+services:
+  stt:
+    build: .
+    # Or: image: <your Coolify-built STT image>
+    ports:
+      - "8000:8000"
+    environment:
+      STT_WORKER_SECRET: ${STT_WORKER_SECRET}
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      DOWNLOAD_TIMEOUT: ${DOWNLOAD_TIMEOUT:-120}
+      TRANSCRIBE_TIMEOUT: ${TRANSCRIBE_TIMEOUT:-600}
+      METADATA_TIMEOUT: ${METADATA_TIMEOUT:-30}
+      # Must match service name below — same Compose network DNS
+      POT_PROVIDER_URL: ${POT_PROVIDER_URL:-http://bgutil-pot:4416}
+      # Optional cookie fallback only (not needed for Contabo no-cookie path):
+      # YTDLP_COOKIES_FILE: /data/youtube.cookies.txt
+      # YTDLP_COOKIES: ${YTDLP_COOKIES:-}
+    depends_on:
+      - bgutil-pot
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+
+  # Official HTTP POT provider. Internal only — do not publish 4416.
+  # https://hub.docker.com/r/brainicism/bgutil-ytdlp-pot-provider
+  bgutil-pot:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    expose:
+      - "4416"
+    restart: unless-stopped

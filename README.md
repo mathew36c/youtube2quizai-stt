@@ -60,67 +60,44 @@ WHISPER_MODEL=small
 
 Do **not** set cookie envs for the no-cookie Contabo path.
 
-## Coolify compose sketch (STT + bgutil sidecar)
+## Coolify Docker Compose (STT + bgutil-pot)
 
-Deploy as a **Docker Compose** application (or two services on the same Coolify network). The POT provider is a **sidecar** — it is **not** baked into the STT image.
+Use the repo-root **`docker-compose.yml`**. Deploy as a Coolify **Docker Compose** application so both services share one Compose network. Service hostname **`bgutil-pot`** resolves to the sidecar; `POT_PROVIDER_URL=http://bgutil-pot:4416` then works (fixes Contabo `Could not resolve host: bgutil-pot`). The POT provider is a **sidecar** — it is **not** baked into the STT image.
 
-```yaml
-services:
-  stt:
-    build: .   # this repo / workers/stt Dockerfile
-    # Or: image: <your Coolify-built STT image>
-    ports:
-      - "8000:8000"
-    environment:
-      STT_WORKER_SECRET: ${STT_WORKER_SECRET}
-      WHISPER_MODEL: small
-      # Exact env name — plugin uses this as youtubepot-bgutilhttp:base_url
-      POT_PROVIDER_URL: http://bgutil-pot:4416
-    depends_on:
-      - bgutil-pot
-    networks:
-      - stt-net
-    restart: unless-stopped
+Compose services:
 
-  # Official HTTP POT provider (Node by default). Listens on 4416 inside the network.
-  # https://github.com/Brainicism/bgutil-ytdlp-pot-provider
-  # https://hub.docker.com/r/brainicism/bgutil-ytdlp-pot-provider
-  bgutil-pot:
-    image: brainicism/bgutil-ytdlp-pot-provider:latest
-    # Do NOT publish 4416 publicly; only the STT service needs it on the internal network.
-    expose:
-      - "4416"
-    networks:
-      - stt-net
-    restart: unless-stopped
-
-networks:
-  stt-net:
-    driver: bridge
-```
+| Service | Role |
+|---------|------|
+| `stt` | Builds from this repo’s `Dockerfile` (uvicorn `:8000`, healthcheck `/health`) |
+| `bgutil-pot` | `brainicism/bgutil-ytdlp-pot-provider:latest` — **expose 4416 only** (no public ports) |
 
 ### Same Coolify / Compose network (required)
 
-**`bgutil-pot` and STT must share one Docker/Coolify network** (Compose `networks:` as in the sketch above, or Coolify “Connect to predefined network”). Hostname `bgutil-pot` only resolves across that shared network — a sidecar “running on 4416” on a *different* network still yields `potProviderReachable: false` and `YOUTUBE_BOT_CHECK`.
+**`stt` and `bgutil-pot` must share one Docker/Coolify network** (default Compose project network from `docker-compose.yml`, or Coolify “Connect to predefined network”). Hostname `bgutil-pot` only resolves on that shared network — a sidecar “running on 4416” on a *different* network still yields `potProviderReachable: false` and `YOUTUBE_BOT_CHECK`.
 
 Diagnose with:
 
 ```bash
-curl -s https://<stt-host>/health
+curl -s https://<stt-host>/health?deep=1
 # expect potProviderReachable: true when networks are correct
 curl -s https://<stt-host>/health/deep
 ```
 
-### Coolify steps (exact)
+### Coolify steps (Docker Compose)
 
-1. **Redeploy STT** from `mathew36c/youtube2quizai-stt` **main** after this commit (or sync folder `youtube2quizai/workers/stt`). Confirm image build installs `bgutil-ytdlp-pot-provider` from PyPI.
-2. Add sidecar service **`bgutil-pot`** with image `brainicism/bgutil-ytdlp-pot-provider:latest` on the **same Docker network** as STT (Compose file or Coolify shared network). Do not expose port 4416 to the public internet.
-3. On the STT service, set env:
-   - `POT_PROVIDER_URL=http://bgutil-pot:4416`
-   - (keep existing) `STT_WORKER_SECRET=…`
-4. Restart/redeploy both. Hit `GET /health` — expect `"potProviderUrl": "http://bgutil-pot:4416"` and `"potProviderReachable": true`.
+1. In Coolify, create/redeploy the STT app as **Docker Compose** from `mathew36c/youtube2quizai-stt` **main** (compose file: `docker-compose.yml` at repo root). Or sync folder `youtube2quizai/workers/stt`.
+2. Set Coolify environment / secrets (do **not** bake into the image):
+   - `STT_WORKER_SECRET=<same secret the app uses>` **(required)**
+   - `WHISPER_MODEL=small` (optional; default in compose)
+   - `POT_PROVIDER_URL=http://bgutil-pot:4416` (optional; default in compose / Dockerfile — keep this hostname)
+3. Deploy the compose stack. Coolify builds `stt` from the Dockerfile and pulls `bgutil-pot`. Do **not** publish port `4416` publicly.
+4. Check reachability:
+   ```bash
+   curl -s https://<stt-host>/health?deep=1
+   ```
+   Expect `"potProviderUrl": "http://bgutil-pot:4416"` and `"potProviderReachable": true`.
 5. Retest `POST /v1/transcribe` with `videoId=rA91cjP1vEg` (previous Contabo `YOUTUBE_BOT_CHECK`).
-6. If still 503: read `potProviderReachable` + `hint` in the error body. If unreachable → fix Coolify/Compose network. If reachable → residential proxy or optional cookies. Also check sidecar logs (`bgutil-pot`) and that yt-dlp would show `PO Token Providers: bgutil:http-…`. Optional last resort only: cookies (Matt refuses export — skip).
+6. If still 503: read `potProviderReachable` + `hint` in the error body. If unreachable → fix Coolify/Compose network / redeploy compose (not separate apps). If reachable → residential proxy or optional cookies. Also check sidecar logs (`bgutil-pot`) and that yt-dlp would show `PO Token Providers: bgutil:http-…`. Optional last resort only: cookies (Matt refuses export — skip).
 
 Plugin docs: [Brainicism/bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) · [yt-dlp PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide).
 
@@ -162,6 +139,16 @@ curl -s -X POST http://127.0.0.1:8000/v1/transcribe \
 
 ## Docker / Coolify
 
+**Preferred (shared network):** use `docker-compose.yml` so `stt` + `bgutil-pot` resolve each other:
+
+```bash
+export STT_WORKER_SECRET=changeme
+docker compose up --build -d
+curl -s "http://127.0.0.1:8000/health?deep=1"   # potProviderReachable: true
+```
+
+Single-container smoke (POT on host only):
+
 ```bash
 docker build -t stt-worker .
 docker run --rm -p 8000:8000 \
@@ -171,4 +158,4 @@ docker run --rm -p 8000:8000 \
   stt-worker
 ```
 
-**Coolify**: build from this Dockerfile, map port **8000**, set `STT_WORKER_SECRET` + `POT_PROVIDER_URL`, run sidecar on shared network. Do not bake secrets into the image. Do not require cookies for Contabo.
+**Coolify**: deploy **Docker Compose** from this repo (`docker-compose.yml`), set `STT_WORKER_SECRET` (and optional `WHISPER_MODEL` / `POT_PROVIDER_URL`), confirm `/health?deep=1` shows `potProviderReachable: true`. Do not bake secrets into the image. Do not require cookies for Contabo.
