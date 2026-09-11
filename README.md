@@ -6,7 +6,7 @@ Coolify-deployable Speech-to-Text worker: downloads YouTube audio with **yt-dlp*
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/health` | none | `{"ok": true}` |
+| `GET` | `/health` | none | `{"ok": true, "potProviderUrl": "...", "cookiesConfigured": false, "model": "small"}` |
 | `POST` | `/v1/transcribe` | Bearer `STT_WORKER_SECRET` | Transcribe a YouTube video |
 
 **Request body** (JSON): `{ "videoId": "..." }` and/or `{ "youtubeUrl": "..." }`.
@@ -15,29 +15,90 @@ Coolify-deployable Speech-to-Text worker: downloads YouTube audio with **yt-dlp*
 
 **Errors**: `{ "error": "message", "code"?: "…" }` with 4xx/5xx (401 auth, 400 bad input / too long, 429 busy, 503 YouTube bot check, 504 timeout).
 
-When YouTube returns “Sign in to confirm you’re not a bot”, the worker responds **503** with `"code": "YOUTUBE_BOT_CHECK"`. Prefer fixing via player client / PO token / proxy first; cookies are optional (see below).
+When YouTube returns “Sign in to confirm you’re not a bot”, the worker responds **503** with `"code": "YOUTUBE_BOT_CHECK"`. Prefer **android player client + bgutil PO Token sidecar** (no cookies). Cookies are optional last resort only.
 
-## YouTube download (no cookies when possible)
+## YouTube download (no cookies)
 
-yt-dlp is configured with `extractor_args` preferring the **android** player client first (`android`, `android_vr`, `ios`, `tv`, `web`). On many networks this downloads audio **without cookies** (avoids the web client bot-check). Cookies remain an **optional** fallback when `YTDLP_COOKIES_FILE` / `/data/youtube.cookies.txt` / `YTDLP_COOKIES` is present — they are **not required**.
-
-If android still fails on a datacenter IP (e.g. Contabo):
-
-1. **PO Token provider** — run [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) (Docker) and point yt-dlp at it (future worker env wiring).
-2. **Residential proxy** — set a proxy env later so yt-dlp egresses via residential IP.
-3. **Cookies** — still supported as last-resort fallback (see below).
+1. **android-first** `player_client` (`android`, `android_vr`, `ios`, `tv`, `web`) — often enough on residential IPs.
+2. **bgutil PO Token sidecar** — required on datacenter IPs (e.g. Contabo). This image installs the PyPI plugin `bgutil-ytdlp-pot-provider` and points yt-dlp at `POT_PROVIDER_URL` via extractor arg `youtubepot-bgutilhttp:base_url=…`.
+3. **Cookies** — optional fallback only (`YTDLP_COOKIES_FILE` / `YTDLP_COOKIES`). **Not required** and not used in the Contabo no-cookie path.
 
 ## Environment
 
 | Variable | Required | Default | Notes |
 |----------|----------|---------|-------|
 | `STT_WORKER_SECRET` | **yes** | — | Bearer token for `/v1/transcribe` |
+| `POT_PROVIDER_URL` | no (recommended on Contabo) | `http://bgutil-pot:4416` | HTTP base URL of the **bgutil** POT sidecar. Wired as yt-dlp `--extractor-args "youtubepot-bgutilhttp:base_url=<URL>"`. Set to `off` / `false` / `0` / empty to disable. Hostname must resolve on the Coolify shared network (compose service name `bgutil-pot` below). |
 | `WHISPER_MODEL` | no | `small` | `tiny` / `base` / `small` |
 | `DOWNLOAD_TIMEOUT` | no | `120` | seconds |
 | `TRANSCRIBE_TIMEOUT` | no | `600` | seconds |
 | `METADATA_TIMEOUT` | no | `30` | seconds |
-| `YTDLP_COOKIES_FILE` | no | `/data/youtube.cookies.txt` if that file exists | Optional cookie fallback: path to Netscape `cookies.txt` (mount a volume in Coolify). Not required when android client works. |
-| `YTDLP_COOKIES` | no | — | Optional alternate: paste full Netscape `cookies.txt` contents; worker writes a temp file. Prefer file mount when using cookies. **Never commit real cookies to git.** |
+| `YTDLP_COOKIES_FILE` | no | `/data/youtube.cookies.txt` if that file exists | Optional cookie fallback only. |
+| `YTDLP_COOKIES` | no | — | Optional alternate cookie contents. Prefer file mount. **Never commit real cookies.** |
+
+### Env names Senior must set on Contabo STT service
+
+```text
+STT_WORKER_SECRET=<same secret the app uses>
+POT_PROVIDER_URL=http://bgutil-pot:4416
+WHISPER_MODEL=small
+```
+
+Do **not** set cookie envs for the no-cookie Contabo path.
+
+## Coolify compose sketch (STT + bgutil sidecar)
+
+Deploy as a **Docker Compose** application (or two services on the same Coolify network). The POT provider is a **sidecar** — it is **not** baked into the STT image.
+
+```yaml
+services:
+  stt:
+    build: .   # this repo / workers/stt Dockerfile
+    # Or: image: <your Coolify-built STT image>
+    ports:
+      - "8000:8000"
+    environment:
+      STT_WORKER_SECRET: ${STT_WORKER_SECRET}
+      WHISPER_MODEL: small
+      # Exact env name — plugin uses this as youtubepot-bgutilhttp:base_url
+      POT_PROVIDER_URL: http://bgutil-pot:4416
+    depends_on:
+      - bgutil-pot
+    networks:
+      - stt-net
+    restart: unless-stopped
+
+  # Official HTTP POT provider (Node by default). Listens on 4416 inside the network.
+  # https://github.com/Brainicism/bgutil-ytdlp-pot-provider
+  # https://hub.docker.com/r/brainicism/bgutil-ytdlp-pot-provider
+  bgutil-pot:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    # Do NOT publish 4416 publicly; only the STT service needs it on the internal network.
+    expose:
+      - "4416"
+    networks:
+      - stt-net
+    restart: unless-stopped
+
+networks:
+  stt-net:
+    driver: bridge
+```
+
+### Coolify steps (exact)
+
+1. **Redeploy STT** from `mathew36c/youtube2quizai-stt` **main** after this commit (or sync folder `youtube2quizai/workers/stt`). Confirm image build installs `bgutil-ytdlp-pot-provider` from PyPI.
+2. Add sidecar service **`bgutil-pot`** with image `brainicism/bgutil-ytdlp-pot-provider:latest` on the **same Docker network** as STT. Do not expose port 4416 to the public internet.
+3. On the STT service, set env:
+   - `POT_PROVIDER_URL=http://bgutil-pot:4416`
+   - (keep existing) `STT_WORKER_SECRET=…`
+4. Restart/redeploy both. Hit `GET /health` — expect `"potProviderUrl": "http://bgutil-pot:4416"`.
+5. Retest `POST /v1/transcribe` with `videoId=rA91cjP1vEg` (previous Contabo `YOUTUBE_BOT_CHECK`).
+6. If still 503: check sidecar logs (`bgutil-pot`), confirm DNS `bgutil-pot` resolves from STT, and that yt-dlp verbose would show `PO Token Providers: bgutil:http-…`. Optional last resort only: cookies (Matt refuses export — skip).
+
+Plugin docs: [Brainicism/bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) · [yt-dlp PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide).
+
+> Note: JS/Deno for BotGuard runs **inside the sidecar** image. The STT image only needs the Python plugin. Optional future: install Deno in the STT image if yt-dlp EJS challenge solving is needed separately from POT.
 
 ## RAM note
 
@@ -58,7 +119,9 @@ cd workers/stt
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 # ffmpeg must be on PATH
+# Optional local POT server: docker run --rm -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
 export STT_WORKER_SECRET=dev-secret
+export POT_PROVIDER_URL=http://127.0.0.1:4416
 export WHISPER_MODEL=tiny   # faster for local smoke tests
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
@@ -78,16 +141,8 @@ docker build -t stt-worker .
 docker run --rm -p 8000:8000 \
   -e STT_WORKER_SECRET=changeme \
   -e WHISPER_MODEL=small \
+  -e POT_PROVIDER_URL=http://host.docker.internal:4416 \
   stt-worker
 ```
 
-**Coolify**: point the service at this folder (Dockerfile), map port **8000**, set `STT_WORKER_SECRET` (and optionally `WHISPER_MODEL`) in the service env. Do not bake secrets into the image.
-
-### YouTube bot check / cookies (optional fallback)
-
-The worker prefers the **android** player client so cookies are usually unnecessary. If you still hit bot-check on a datacenter IP, try PO Token / residential proxy (above), or supply cookies as a last resort:
-
-1. Mount a volume at `/data` and place `youtube.cookies.txt` there (auto-used), or set `YTDLP_COOKIES_FILE`.
-2. Or set Coolify env `YTDLP_COOKIES` to full Netscape file contents.
-
-Do **not** commit cookie files or paste real cookies into git / Dockerfiles. Cookies are optional — do not require them for normal deploys.
+**Coolify**: build from this Dockerfile, map port **8000**, set `STT_WORKER_SECRET` + `POT_PROVIDER_URL`, run sidecar on shared network. Do not bake secrets into the image. Do not require cookies for Contabo.

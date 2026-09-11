@@ -31,6 +31,8 @@ DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "120"))
 TRANSCRIBE_TIMEOUT = int(os.environ.get("TRANSCRIBE_TIMEOUT", "600"))
 METADATA_TIMEOUT = int(os.environ.get("METADATA_TIMEOUT", "30"))
 DEFAULT_COOKIES_PATH = "/data/youtube.cookies.txt"
+# bgutil HTTP POT provider (sidecar). Empty / "0" / "off" / "false" disables wiring.
+POT_PROVIDER_URL = (os.environ.get("POT_PROVIDER_URL") or "http://bgutil-pot:4416").strip()
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -84,10 +86,12 @@ async def _get_whisper_model():
 async def lifespan(_app: FastAPI):
     _require_secret()
     _validate_model_name(WHISPER_MODEL)
+    pot = _pot_provider_url()
     logger.info(
-        "STT worker starting (model=%s, max_duration=%ss)",
+        "STT worker starting (model=%s, max_duration=%ss, pot_provider=%s)",
         WHISPER_MODEL,
         MAX_DURATION_SECONDS,
+        pot or "disabled",
     )
     yield
     logger.info("STT worker shutting down")
@@ -220,19 +224,33 @@ def _resolve_cookiefile() -> Optional[str]:
     return None
 
 
-def _ytdlp_extractor_args() -> dict:
-    """Prefer android (and similar) clients so downloads often work without cookies.
+def _pot_provider_url() -> Optional[str]:
+    """Return configured bgutil POT HTTP base URL, or None if disabled."""
+    raw = POT_PROVIDER_URL
+    if not raw or raw.lower() in {"0", "false", "off", "none", "disabled"}:
+        return None
+    return raw.rstrip("/")
 
-    Proven on residential/DHCP networks: player_client=android avoids web bot-check.
-    Cookies remain an optional fallback when present (see _ytdlp_cookie_opts).
+
+def _ytdlp_extractor_args() -> dict:
+    """Prefer android clients; wire bgutil PO Token HTTP provider when configured.
+
+    player_client=android first (no cookies). PO tokens come from the
+    bgutil-ytdlp-pot-provider sidecar via extractor arg
+    youtubepot-bgutilhttp:base_url=<POT_PROVIDER_URL>.
+    Cookies remain an optional last-resort fallback (see _ytdlp_cookie_opts).
     """
-    return {
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "android_vr", "ios", "tv", "web"],
-            }
+    extractor_args: dict = {
+        "youtube": {
+            "player_client": ["android", "android_vr", "ios", "tv", "web"],
         }
     }
+    pot_url = _pot_provider_url()
+    if pot_url:
+        # Plugin key from bgutil-ytdlp-pot-provider (PyPI); see README.
+        extractor_args["youtubepot-bgutilhttp"] = {"base_url": [pot_url]}
+        logger.info("yt-dlp PO token provider base_url=%s", pot_url)
+    return {"extractor_args": extractor_args}
 
 
 def _ytdlp_cookie_opts() -> dict:
@@ -244,15 +262,25 @@ def _ytdlp_cookie_opts() -> dict:
 
 
 def _bot_check_http_exception() -> HTTPException:
+    pot = _pot_provider_url()
+    pot_hint = (
+        f"PO Token provider is configured at {pot}. "
+        "Confirm the Coolify sidecar brainicism/bgutil-ytdlp-pot-provider "
+        "is healthy and reachable on the shared network."
+        if pot
+        else (
+            "Set Coolify env POT_PROVIDER_URL "
+            "(default http://bgutil-pot:4416) and deploy the "
+            "brainicism/bgutil-ytdlp-pot-provider sidecar (see README)."
+        )
+    )
     return HTTPException(
         status_code=503,
         detail={
             "error": (
                 "YouTube bot check blocked audio download even with android "
-                "player client. Optional fallback: provide yt-dlp cookies via "
-                "Coolify env YTDLP_COOKIES_FILE (path to Netscape cookies.txt, "
-                "default /data/youtube.cookies.txt) or YTDLP_COOKIES (contents). "
-                "Or try a PO Token provider / residential proxy (see README)."
+                f"player client. {pot_hint} Cookies are an optional last "
+                "resort (YTDLP_COOKIES_FILE / YTDLP_COOKIES) — not required."
             ),
             "code": "YOUTUBE_BOT_CHECK",
         },
@@ -346,9 +374,11 @@ def _transcribe_file(audio_path: str) -> str:
 
 @app.get("/health")
 async def health():
+    pot = _pot_provider_url()
     return {
         "ok": True,
         "cookiesConfigured": bool(_resolve_cookiefile()),
+        "potProviderUrl": pot,
         "model": WHISPER_MODEL,
     }
 

@@ -1,5 +1,6 @@
 fastapi>=0.115.0,<1.0.0
 uvicorn[standard]>=0.32.0,<1.0.0
 pydantic>=2.0.0,<3.0.0
-yt-dlp>=2024.10.22
+yt-dlp>=2025.05.22
 faster-whisper>=1.0.0,<2.0.0
+bgutil-ytdlp-pot-provider>=2.0.0
