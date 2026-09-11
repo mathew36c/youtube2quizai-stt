@@ -8,10 +8,13 @@ import os
 import re
 import shutil
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
@@ -33,6 +36,9 @@ METADATA_TIMEOUT = int(os.environ.get("METADATA_TIMEOUT", "30"))
 DEFAULT_COOKIES_PATH = "/data/youtube.cookies.txt"
 # bgutil HTTP POT provider (sidecar). Empty / "0" / "off" / "false" disables wiring.
 POT_PROVIDER_URL = (os.environ.get("POT_PROVIDER_URL") or "http://bgutil-pot:4416").strip()
+# Short timeout for /health and bot-check diagnostics (seconds).
+POT_PROBE_TIMEOUT = float(os.environ.get("POT_PROBE_TIMEOUT", "1.5"))
+POT_PROBE_DEEP_TIMEOUT = float(os.environ.get("POT_PROBE_DEEP_TIMEOUT", "3.0"))
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -44,6 +50,12 @@ _job_lock = asyncio.Lock()
 _whisper_model = None
 _model_lock = asyncio.Lock()
 _COOKIE_TMP: Optional[str] = None
+# Last successful/failed POT probe (updated by /health and bot-check).
+_pot_probe_last: dict[str, Any] = {
+    "potProviderReachable": None,
+    "potProviderError": None,
+    "potProviderLatencyMs": None,
+}
 
 
 def _require_secret() -> None:
@@ -87,12 +99,32 @@ async def lifespan(_app: FastAPI):
     _require_secret()
     _validate_model_name(WHISPER_MODEL)
     pot = _pot_provider_url()
+    extractor = _ytdlp_extractor_args()
+    pot_applied = bool(
+        pot and "youtubepot-bgutilhttp" in extractor.get("extractor_args", {})
+    )
     logger.info(
         "STT worker starting (model=%s, max_duration=%ss, pot_provider=%s)",
         WHISPER_MODEL,
         MAX_DURATION_SECONDS,
         pot or "disabled",
     )
+    logger.info(
+        "yt-dlp pot plugin / extractor_args: applied=%s pot_provider_url=%s extractor_args=%s",
+        pot_applied,
+        pot or "disabled",
+        extractor.get("extractor_args"),
+    )
+    if pot:
+        probe = await asyncio.to_thread(_probe_pot_provider, pot, POT_PROBE_TIMEOUT)
+        logger.info(
+            "POT provider startup probe: reachable=%s latencyMs=%s error=%s",
+            probe.get("potProviderReachable"),
+            probe.get("potProviderLatencyMs"),
+            probe.get("potProviderError"),
+        )
+    else:
+        logger.info("POT provider disabled — skipping reachability probe")
     yield
     logger.info("STT worker shutting down")
 
@@ -232,6 +264,106 @@ def _pot_provider_url() -> Optional[str]:
     return raw.rstrip("/")
 
 
+def _probe_pot_provider(
+    base_url: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> dict[str, Any]:
+    """Probe bgutil POT HTTP provider reachability.
+
+    Tries GET /ping (official bgutil health), then GET / as fallback.
+    Any HTTP response counts as reachable (network path OK); connection /
+    DNS / timeout failures mean unreachable — the Coolify network suspect.
+    """
+    global _pot_probe_last
+    url = base_url if base_url is not None else _pot_provider_url()
+    t_out = POT_PROBE_TIMEOUT if timeout is None else timeout
+    if not url:
+        result: dict[str, Any] = {
+            "potProviderUrl": None,
+            "potProviderReachable": None,
+            "potProviderError": None,
+            "potProviderLatencyMs": None,
+        }
+        return result
+
+    candidates = [f"{url}/ping", f"{url}/"]
+    last_error: Optional[str] = None
+    t0 = time.monotonic()
+    for candidate in candidates:
+        try:
+            req = urllib.request.Request(
+                candidate,
+                method="GET",
+                headers={"Accept": "application/json,*/*", "User-Agent": "stt-worker-pot-probe"},
+            )
+            with urllib.request.urlopen(req, timeout=t_out) as resp:
+                code = int(resp.getcode())
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                err = None if 200 <= code < 300 else f"HTTP {code} from {candidate}"
+                result = {
+                    "potProviderUrl": url,
+                    "potProviderReachable": True,
+                    "potProviderError": err,
+                    "potProviderLatencyMs": latency_ms,
+                }
+                _pot_probe_last = {
+                    "potProviderReachable": True,
+                    "potProviderError": err,
+                    "potProviderLatencyMs": latency_ms,
+                }
+                return result
+        except urllib.error.HTTPError as e:
+            # Got an HTTP response → host is reachable on the network.
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            err = f"HTTP {e.code} from {candidate}"
+            result = {
+                "potProviderUrl": url,
+                "potProviderReachable": True,
+                "potProviderError": err,
+                "potProviderLatencyMs": latency_ms,
+            }
+            _pot_probe_last = {
+                "potProviderReachable": True,
+                "potProviderError": err,
+                "potProviderLatencyMs": latency_ms,
+            }
+            return result
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            continue
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    result = {
+        "potProviderUrl": url,
+        "potProviderReachable": False,
+        "potProviderError": last_error or "unreachable",
+        "potProviderLatencyMs": latency_ms,
+    }
+    _pot_probe_last = {
+        "potProviderReachable": False,
+        "potProviderError": result["potProviderError"],
+        "potProviderLatencyMs": latency_ms,
+    }
+    return result
+
+
+def _health_pot_fields(probe: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    pot = _pot_provider_url()
+    if probe is None:
+        return {
+            "potProviderUrl": pot,
+            "potProviderReachable": _pot_probe_last.get("potProviderReachable"),
+            "potProviderError": _pot_probe_last.get("potProviderError"),
+            "potProviderLatencyMs": _pot_probe_last.get("potProviderLatencyMs"),
+        }
+    return {
+        "potProviderUrl": pot,
+        "potProviderReachable": probe.get("potProviderReachable"),
+        "potProviderError": probe.get("potProviderError"),
+        "potProviderLatencyMs": probe.get("potProviderLatencyMs"),
+    }
+
+
 def _ytdlp_extractor_args() -> dict:
     """Prefer android clients; wire bgutil PO Token HTTP provider when configured.
 
@@ -263,26 +395,45 @@ def _ytdlp_cookie_opts() -> dict:
 
 def _bot_check_http_exception() -> HTTPException:
     pot = _pot_provider_url()
-    pot_hint = (
-        f"PO Token provider is configured at {pot}. "
-        "Confirm the Coolify sidecar brainicism/bgutil-ytdlp-pot-provider "
-        "is healthy and reachable on the shared network."
+    pot_configured = bool(pot)
+    probe = (
+        _probe_pot_provider(pot, POT_PROBE_TIMEOUT)
         if pot
-        else (
-            "Set Coolify env POT_PROVIDER_URL "
-            "(default http://bgutil-pot:4416) and deploy the "
-            "brainicism/bgutil-ytdlp-pot-provider sidecar (see README)."
-        )
+        else {
+            "potProviderReachable": None,
+            "potProviderError": None,
+            "potProviderLatencyMs": None,
+        }
     )
+    reachable = probe.get("potProviderReachable")
+    if not pot_configured:
+        hint = (
+            "Set POT_PROVIDER_URL and deploy bgutil-pot sidecar on the same "
+            "Coolify/Compose network as STT"
+        )
+    elif reachable is False:
+        hint = "STT cannot reach POT provider; put both on same Docker network"
+    elif reachable is True:
+        hint = (
+            "POT reachable but YouTube still blocked; try residential proxy or cookies"
+        )
+    else:
+        hint = (
+            "PO Token provider configured but reachability unknown; "
+            "confirm Coolify shared network with bgutil-pot"
+        )
     return HTTPException(
         status_code=503,
         detail={
             "error": (
                 "YouTube bot check blocked audio download even with android "
-                f"player client. {pot_hint} Cookies are an optional last "
-                "resort (YTDLP_COOKIES_FILE / YTDLP_COOKIES) — not required."
+                f"player client. {hint}"
             ),
             "code": "YOUTUBE_BOT_CHECK",
+            "potConfigured": pot_configured,
+            "potProviderUrl": pot,
+            "potProviderReachable": reachable,
+            "hint": hint,
         },
     )
 
@@ -372,15 +523,53 @@ def _transcribe_file(audio_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/health")
-async def health():
+async def _health_payload(*, deep: bool = False) -> dict[str, Any]:
+    global _pot_probe_last
     pot = _pot_provider_url()
-    return {
+    probe: Optional[dict[str, Any]] = None
+    if pot:
+        timeout = POT_PROBE_DEEP_TIMEOUT if deep else POT_PROBE_TIMEOUT
+        try:
+            probe = await asyncio.wait_for(
+                asyncio.to_thread(_probe_pot_provider, pot, timeout),
+                timeout=timeout + 0.5,
+            )
+        except asyncio.TimeoutError:
+            probe = {
+                "potProviderUrl": pot,
+                "potProviderReachable": False,
+                "potProviderError": f"probe timed out after {timeout}s",
+                "potProviderLatencyMs": int(timeout * 1000),
+            }
+            _pot_probe_last = {
+                "potProviderReachable": False,
+                "potProviderError": probe["potProviderError"],
+                "potProviderLatencyMs": probe["potProviderLatencyMs"],
+            }
+    payload = {
         "ok": True,
         "cookiesConfigured": bool(_resolve_cookiefile()),
-        "potProviderUrl": pot,
         "model": WHISPER_MODEL,
+        **_health_pot_fields(probe),
     }
+    if deep:
+        payload["deep"] = True
+    return payload
+
+
+@app.get("/health")
+async def health(deep: Optional[int] = Query(default=None)):
+    """Liveness + quick POT reachability probe (1–2s timeout).
+
+    Pass ?deep=1 for the longer probe (same as GET /health/deep).
+    """
+    return await _health_payload(deep=bool(deep))
+
+
+@app.get("/health/deep")
+async def health_deep():
+    """Always live-probe the POT provider with a slightly longer timeout."""
+    return await _health_payload(deep=True)
 
 
 @app.exception_handler(HTTPException)

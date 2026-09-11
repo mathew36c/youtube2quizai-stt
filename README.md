@@ -6,7 +6,8 @@ Coolify-deployable Speech-to-Text worker: downloads YouTube audio with **yt-dlp*
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/health` | none | `{"ok": true, "potProviderUrl": "...", "cookiesConfigured": false, "model": "small"}` |
+| `GET` | `/health` | none | Liveness + quick POT probe (`potProviderUrl`, `potProviderReachable`, `potProviderError`, `potProviderLatencyMs`, …). Pass `?deep=1` for a longer probe. |
+| `GET` | `/health/deep` | none | Always live-probes POT provider (GET `{POT_PROVIDER_URL}/ping`). |
 | `POST` | `/v1/transcribe` | Bearer `STT_WORKER_SECRET` | Transcribe a YouTube video |
 
 **Request body** (JSON): `{ "videoId": "..." }` and/or `{ "youtubeUrl": "..." }`.
@@ -15,7 +16,20 @@ Coolify-deployable Speech-to-Text worker: downloads YouTube audio with **yt-dlp*
 
 **Errors**: `{ "error": "message", "code"?: "…" }` with 4xx/5xx (401 auth, 400 bad input / too long, 429 busy, 503 YouTube bot check, 504 timeout).
 
-When YouTube returns “Sign in to confirm you’re not a bot”, the worker responds **503** with `"code": "YOUTUBE_BOT_CHECK"`. Prefer **android player client + bgutil PO Token sidecar** (no cookies). Cookies are optional last resort only.
+When YouTube returns “Sign in to confirm you’re not a bot”, the worker responds **503** with:
+
+```json
+{
+  "error": "…",
+  "code": "YOUTUBE_BOT_CHECK",
+  "potConfigured": true,
+  "potProviderUrl": "http://bgutil-pot:4416",
+  "potProviderReachable": false,
+  "hint": "STT cannot reach POT provider; put both on same Docker network"
+}
+```
+
+`hint` is `STT cannot reach POT provider; put both on same Docker network` when the probe fails, or `POT reachable but YouTube still blocked; try residential proxy or cookies` when the sidecar answers but YouTube still blocks. Prefer **android player client + bgutil PO Token sidecar** (no cookies). Cookies are optional last resort only.
 
 ## YouTube download (no cookies)
 
@@ -85,16 +99,28 @@ networks:
     driver: bridge
 ```
 
+### Same Coolify / Compose network (required)
+
+**`bgutil-pot` and STT must share one Docker/Coolify network** (Compose `networks:` as in the sketch above, or Coolify “Connect to predefined network”). Hostname `bgutil-pot` only resolves across that shared network — a sidecar “running on 4416” on a *different* network still yields `potProviderReachable: false` and `YOUTUBE_BOT_CHECK`.
+
+Diagnose with:
+
+```bash
+curl -s https://<stt-host>/health
+# expect potProviderReachable: true when networks are correct
+curl -s https://<stt-host>/health/deep
+```
+
 ### Coolify steps (exact)
 
 1. **Redeploy STT** from `mathew36c/youtube2quizai-stt` **main** after this commit (or sync folder `youtube2quizai/workers/stt`). Confirm image build installs `bgutil-ytdlp-pot-provider` from PyPI.
-2. Add sidecar service **`bgutil-pot`** with image `brainicism/bgutil-ytdlp-pot-provider:latest` on the **same Docker network** as STT. Do not expose port 4416 to the public internet.
+2. Add sidecar service **`bgutil-pot`** with image `brainicism/bgutil-ytdlp-pot-provider:latest` on the **same Docker network** as STT (Compose file or Coolify shared network). Do not expose port 4416 to the public internet.
 3. On the STT service, set env:
    - `POT_PROVIDER_URL=http://bgutil-pot:4416`
    - (keep existing) `STT_WORKER_SECRET=…`
-4. Restart/redeploy both. Hit `GET /health` — expect `"potProviderUrl": "http://bgutil-pot:4416"`.
+4. Restart/redeploy both. Hit `GET /health` — expect `"potProviderUrl": "http://bgutil-pot:4416"` and `"potProviderReachable": true`.
 5. Retest `POST /v1/transcribe` with `videoId=rA91cjP1vEg` (previous Contabo `YOUTUBE_BOT_CHECK`).
-6. If still 503: check sidecar logs (`bgutil-pot`), confirm DNS `bgutil-pot` resolves from STT, and that yt-dlp verbose would show `PO Token Providers: bgutil:http-…`. Optional last resort only: cookies (Matt refuses export — skip).
+6. If still 503: read `potProviderReachable` + `hint` in the error body. If unreachable → fix Coolify/Compose network. If reachable → residential proxy or optional cookies. Also check sidecar logs (`bgutil-pot`) and that yt-dlp would show `PO Token Providers: bgutil:http-…`. Optional last resort only: cookies (Matt refuses export — skip).
 
 Plugin docs: [Brainicism/bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) · [yt-dlp PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide).
 
